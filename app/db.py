@@ -1,17 +1,16 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
 
-"""Real AlloyDB for PostgreSQL persistence and query layer via psycopg2."""
+"""Real AlloyDB for PostgreSQL persistence and pgvector hybrid search via psycopg2."""
 
 from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-import json
 from typing import Any
 
 import psycopg2
-from psycopg2.extras import Json, RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 from app.config import SQL_DIR, Settings
 
@@ -34,6 +33,11 @@ def _serialize_row(row: dict[str, Any]) -> dict[str, Any]:
         else:
             serialized[key] = val
     return serialized
+
+
+def format_vector_literal(embedding: list[float]) -> str:
+    """Formats a Python float list into a pgvector literal string '[x1,x2,...]'."""
+    return "[" + ",".join(f"{float(v):.6f}" for v in embedding) + "]"
 
 
 def get_connection(settings: Settings) -> psycopg2.extensions.connection:
@@ -72,11 +76,12 @@ def init_db(settings: Settings) -> str:
 
 
 def check_db_health(settings: Settings) -> dict[str, Any]:
-    """Verifies live AlloyDB connectivity and checks whether the target table exists."""
+    """Verifies live AlloyDB connectivity, pgvector extension, and target tables."""
     if not settings.is_db_configured():
         return {
             "status": "unconfigured",
             "schema_initialized": False,
+            "vector_enabled": False,
             "detail": "Set DB_HOST, DB_PORT, DB_NAME, and DB_USER in .env.",
         }
     try:
@@ -85,6 +90,7 @@ def check_db_health(settings: Settings) -> dict[str, Any]:
         return {
             "status": "error",
             "schema_initialized": False,
+            "vector_enabled": False,
             "detail": str(exc),
         }
 
@@ -95,245 +101,342 @@ def check_db_health(settings: Settings) -> dict[str, Any]:
                 SELECT
                     version() AS server_version,
                     current_database() AS database_name,
-                    to_regclass('"docprocessing".driverslicense') IS NOT NULL AS table_exists;
+                    EXISTS (
+                        SELECT 1 FROM pg_extension WHERE extname = 'vector'
+                    ) AS vector_enabled,
+                    to_regclass('"docprocessing".documents') IS NOT NULL AS docs_table_exists,
+                    to_regclass('"docprocessing".document_chunks') IS NOT NULL AS chunks_table_exists;
                 """
             )
             info = dict(cur.fetchone())
+
+        schema_ready = bool(
+            info["vector_enabled"] and info["docs_table_exists"] and info["chunks_table_exists"]
+        )
         return {
             "status": "ok",
             "host": settings.DB_HOST,
             "port": settings.DB_PORT,
             "database": info["database_name"],
             "version": info["server_version"],
-            "schema_initialized": bool(info["table_exists"]),
-            "detail": "Connected to AlloyDB for PostgreSQL.",
+            "vector_enabled": bool(info["vector_enabled"]),
+            "schema_initialized": schema_ready,
+            "detail": (
+                "Connected to AlloyDB for PostgreSQL (pgvector active)."
+                if schema_ready
+                else "Connected to AlloyDB; schema initialization required."
+            ),
         }
     except psycopg2.Error as exc:
         return {
             "status": "error",
             "schema_initialized": False,
+            "vector_enabled": False,
             "detail": f"AlloyDB health query failed: {exc}",
         }
     finally:
         conn.close()
 
 
-def insert_license_record(
+def insert_document_and_chunks(
     settings: Settings,
-    record_data: dict[str, Any],
+    doc_meta: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    embeddings: list[list[float]],
 ) -> tuple[dict[str, Any], str]:
-    """Inserts a cleaned driver's license record into AlloyDB and returns SQL proof."""
-    insert_sql = """
-        INSERT INTO "docprocessing".driverslicense (
-            dl_number,
-            given_name,
-            surname,
-            address,
-            dob,
-            expiration_date,
-            issue_date,
-            source_gcs_uri,
-            output_gcs_uri,
-            avg_confidence,
-            raw_entities
+    """Atomically inserts a document record and its 768-d vector chunks into AlloyDB."""
+    if not chunks or len(chunks) != len(embeddings):
+        raise DatabaseServiceError(
+            f"Chunk/embedding mismatch: {len(chunks)} chunks vs {len(embeddings)} vectors."
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING
-            id,
-            dl_number,
-            given_name,
-            surname,
-            address,
-            dob,
-            expiration_date,
-            issue_date,
+
+    filename = str(doc_meta["filename"])
+    title = str(doc_meta["title"])
+    page_count = int(doc_meta.get("page_count") or 1)
+    source_gcs_uri = str(doc_meta["source_gcs_uri"])
+    output_gcs_uri = str(doc_meta["output_gcs_uri"])
+
+    insert_doc_sql = """
+        INSERT INTO "docprocessing".documents (
+            title,
+            filename,
+            page_count,
+            chunk_count,
             source_gcs_uri,
-            output_gcs_uri,
-            avg_confidence,
-            raw_entities,
-            processed_at,
-            CASE
-                WHEN expiration_date IS NULL THEN 'UNKNOWN'
-                WHEN expiration_date < CURRENT_DATE THEN 'EXPIRED'
-                WHEN expiration_date <= CURRENT_DATE + INTERVAL '365 days' THEN 'EXPIRING_SOON'
-                ELSE 'VALID'
-            END AS compliance_status;
+            output_gcs_uri
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id, title, filename, page_count, chunk_count,
+                  source_gcs_uri, output_gcs_uri, processed_at;
     """.strip()
 
-    raw_entities = record_data.get("raw_entities") or []
-    params = (
-        record_data.get("dl_number"),
-        record_data.get("given_name"),
-        record_data.get("surname"),
-        record_data.get("address"),
-        record_data.get("dob"),
-        record_data.get("expiration_date"),
-        record_data.get("issue_date"),
-        record_data.get("source_gcs_uri"),
-        record_data.get("output_gcs_uri"),
-        record_data.get("avg_confidence"),
-        Json(raw_entities),
-    )
+    insert_chunks_sql = """
+        INSERT INTO "docprocessing".document_chunks (
+            document_id,
+            chunk_index,
+            page_start,
+            page_end,
+            section_heading,
+            content,
+            token_estimate,
+            embedding
+        )
+        VALUES %s;
+    """.strip()
 
     conn = get_connection(settings)
     try:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(insert_sql, params)
-                inserted = dict(cur.fetchone())
+                # Replace prior index entries when re-ingesting the same filename
+                cur.execute(
+                    'DELETE FROM "docprocessing".documents WHERE filename = %s;',
+                    (filename,),
+                )
+                cur.execute(
+                    insert_doc_sql,
+                    (title, filename, page_count, len(chunks), source_gcs_uri, output_gcs_uri),
+                )
+                doc_row = dict(cur.fetchone())
+                doc_id = int(doc_row["id"])
+
+                chunk_rows = [
+                    (
+                        doc_id,
+                        int(chunk["chunk_index"]),
+                        int(chunk["page_start"]),
+                        int(chunk["page_end"]),
+                        chunk.get("section_heading"),
+                        str(chunk["content"]),
+                        int(chunk.get("token_estimate") or 0),
+                        format_vector_literal(vec),
+                    )
+                    for chunk, vec in zip(chunks, embeddings)
+                ]
+
+                execute_values(
+                    cur,
+                    insert_chunks_sql,
+                    chunk_rows,
+                    template="(%s, %s, %s, %s, %s, %s, %s, %s::vector)",
+                    page_size=100,
+                )
     except psycopg2.Error as exc:
-        raise DatabaseServiceError(f"Failed to insert record into AlloyDB: {exc}") from exc
+        raise DatabaseServiceError(f"Failed to persist document chunks in AlloyDB: {exc}") from exc
     finally:
         conn.close()
 
-    def _sql_literal(val: Any) -> str:
-        if val is None:
-            return "NULL"
-        if isinstance(val, date):
-            return f"'{val.isoformat()}'"
-        if isinstance(val, (int, float)):
-            return str(val)
-        escaped = str(val).replace("'", "''")
-        return f"'{escaped}'"
-
+    preview_vec = "[" + ",".join(f"{v:.4f}" for v in embeddings[0][:4]) + ", ... (768 dims)]"
     sql_proof = (
-        "-- Executed parameterized INSERT against AlloyDB for PostgreSQL\n"
-        'INSERT INTO "docprocessing".driverslicense (\n'
-        "    dl_number, given_name, surname, address, dob,\n"
-        "    expiration_date, issue_date, source_gcs_uri,\n"
-        "    output_gcs_uri, avg_confidence, raw_entities\n"
+        "-- Executed transactional document + pgvector batch INSERT in AlloyDB\n"
+        'DELETE FROM "docprocessing".documents WHERE filename = ' + f"'{filename}';\n\n"
+        'INSERT INTO "docprocessing".documents (\n'
+        "    title, filename, page_count, chunk_count, source_gcs_uri, output_gcs_uri\n"
         ") VALUES (\n"
-        f"    {_sql_literal(record_data.get('dl_number'))},\n"
-        f"    {_sql_literal(record_data.get('given_name'))},\n"
-        f"    {_sql_literal(record_data.get('surname'))},\n"
-        f"    {_sql_literal(record_data.get('address'))},\n"
-        f"    {_sql_literal(record_data.get('dob'))},\n"
-        f"    {_sql_literal(record_data.get('expiration_date'))},\n"
-        f"    {_sql_literal(record_data.get('issue_date'))},\n"
-        f"    {_sql_literal(record_data.get('source_gcs_uri'))},\n"
-        f"    {_sql_literal(record_data.get('output_gcs_uri'))},\n"
-        f"    {_sql_literal(record_data.get('avg_confidence'))},\n"
-        f"    '{json.dumps(raw_entities)[:180]}...'::jsonb\n"
-        ") RETURNING id, processed_at;"
+        f"    '{title.replace(chr(39), chr(39)*2)}',\n"
+        f"    '{filename}', {page_count}, {len(chunks)},\n"
+        f"    '{source_gcs_uri}',\n"
+        f"    '{output_gcs_uri}'\n"
+        ") RETURNING id, processed_at;\n\n"
+        f"-- Bulk inserted {len(chunks)} chunks into \"docprocessing\".document_chunks\n"
+        'INSERT INTO "docprocessing".document_chunks (\n'
+        "    document_id, chunk_index, page_start, page_end,\n"
+        "    section_heading, content, token_estimate, embedding\n"
+        ") VALUES\n"
+        f"    ({doc_id}, 0, {chunks[0]['page_start']}, {chunks[0]['page_end']}, ..., '{preview_vec}'::vector),\n"
+        f"    ... ({len(chunks)} total HNSW-indexed rows);"
     )
 
-    return _serialize_row(inserted), sql_proof
+    return _serialize_row(doc_row), sql_proof
 
 
-def query_license_records(
+def hybrid_search_chunks(
     settings: Settings,
-    status_filter: str | None = None,
-    search: str | None = None,
-    limit: int = 50,
-) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
-    """Queries driver's license records and aggregate compliance metrics from AlloyDB."""
-    where_clauses: list[str] = []
-    params: list[Any] = []
+    query_embedding: list[float],
+    query_text: str,
+    document_id: int | None = None,
+    top_k: int = 5,
+) -> tuple[list[dict[str, Any]], str]:
+    """Runs hybrid pgvector cosine + PostgreSQL FTS search over document_chunks."""
+    vec_literal = format_vector_literal(query_embedding)
+    clean_query = query_text.strip()
 
-    if status_filter:
-        normalized = status_filter.strip().upper()
-        if normalized == "EXPIRED":
-            where_clauses.append("expiration_date < CURRENT_DATE")
-        elif normalized == "EXPIRING_SOON":
-            where_clauses.append(
-                "expiration_date >= CURRENT_DATE AND expiration_date <= CURRENT_DATE + INTERVAL '365 days'"
-            )
-        elif normalized == "VALID":
-            where_clauses.append("expiration_date > CURRENT_DATE + INTERVAL '365 days'")
-
-    if search and search.strip():
-        term = f"%{search.strip()}%"
-        where_clauses.append(
-            "(dl_number ILIKE %s OR given_name ILIKE %s OR surname ILIKE %s OR address ILIKE %s)"
-        )
-        params.extend([term, term, term, term])
-
-    where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-
-    select_sql = f"""
+    hybrid_sql = """
         SELECT
-            id,
-            dl_number,
-            given_name,
-            surname,
-            address,
-            dob,
-            expiration_date,
-            issue_date,
-            source_gcs_uri,
-            output_gcs_uri,
-            avg_confidence,
-            raw_entities,
-            processed_at,
-            CASE
-                WHEN expiration_date IS NULL THEN 'UNKNOWN'
-                WHEN expiration_date < CURRENT_DATE THEN 'EXPIRED'
-                WHEN expiration_date <= CURRENT_DATE + INTERVAL '365 days' THEN 'EXPIRING_SOON'
-                ELSE 'VALID'
-            END AS compliance_status
-        FROM "docprocessing".driverslicense
-        {where_sql}
-        ORDER BY processed_at DESC, id DESC
+            c.id AS chunk_id,
+            c.document_id,
+            d.title AS document_title,
+            d.filename,
+            c.chunk_index,
+            c.page_start,
+            c.page_end,
+            c.section_heading,
+            c.content,
+            ROUND((1 - (c.embedding <=> %s::vector))::numeric, 4) AS vector_similarity,
+            ROUND(
+                ts_rank_cd(
+                    to_tsvector('english', coalesce(c.section_heading, '') || ' ' || c.content),
+                    websearch_to_tsquery('english', %s)
+                )::numeric,
+                4
+            ) AS keyword_score,
+            ROUND(
+                (
+                    0.82 * (1 - (c.embedding <=> %s::vector))
+                    + 0.18 * LEAST(
+                        ts_rank_cd(
+                            to_tsvector('english', coalesce(c.section_heading, '') || ' ' || c.content),
+                            websearch_to_tsquery('english', %s)
+                        ),
+                        1.0
+                    )
+                )::numeric,
+                4
+            ) AS hybrid_score
+        FROM "docprocessing".document_chunks c
+        JOIN "docprocessing".documents d ON d.id = c.document_id
+        WHERE (%s::integer IS NULL OR c.document_id = %s::integer)
+        ORDER BY hybrid_score DESC, c.embedding <=> %s::vector ASC
         LIMIT %s;
-    """.strip()
-
-    summary_sql = """
-        SELECT
-            COUNT(*)::int AS total,
-            COUNT(*) FILTER (
-                WHERE expiration_date > CURRENT_DATE + INTERVAL '365 days'
-            )::int AS valid,
-            COUNT(*) FILTER (
-                WHERE expiration_date >= CURRENT_DATE
-                  AND expiration_date <= CURRENT_DATE + INTERVAL '365 days'
-            )::int AS expiring_soon,
-            COUNT(*) FILTER (
-                WHERE expiration_date < CURRENT_DATE
-            )::int AS expired,
-            ROUND(AVG(avg_confidence)::numeric, 4) AS avg_confidence
-        FROM "docprocessing".driverslicense;
     """.strip()
 
     conn = get_connection(settings)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(select_sql, [*params, limit])
+            cur.execute(
+                hybrid_sql,
+                (
+                    vec_literal,
+                    clean_query,
+                    vec_literal,
+                    clean_query,
+                    document_id,
+                    document_id,
+                    vec_literal,
+                    top_k,
+                ),
+            )
             rows = [_serialize_row(dict(r)) for r in cur.fetchall()]
+    except psycopg2.Error as exc:
+        raise DatabaseServiceError(f"Hybrid vector search failed in AlloyDB: {exc}") from exc
+    finally:
+        conn.close()
 
+    preview_vec = "[" + ",".join(f"{v:.4f}" for v in query_embedding[:4]) + ", ... (768 dims)]"
+    escaped_q = clean_query.replace("'", "''")
+    doc_filter_sql = "NULL" if document_id is None else str(int(document_id))
+    sql_proof = (
+        "-- Executed AlloyDB pgvector cosine + GIN full-text hybrid search\n"
+        f"-- Query: '{escaped_q}' | Document filter: {doc_filter_sql} | Limit: {top_k}\n"
+        "SELECT\n"
+        "    c.id AS chunk_id,\n"
+        "    d.title AS document_title,\n"
+        "    c.page_start,\n"
+        "    c.page_end,\n"
+        "    c.section_heading,\n"
+        f"    ROUND((1 - (c.embedding <=> '{preview_vec}'::vector))::numeric, 4) AS vector_similarity,\n"
+        "    ROUND(ts_rank_cd(to_tsvector('english', coalesce(c.section_heading, '') || ' ' || c.content),\n"
+        f"                     websearch_to_tsquery('english', '{escaped_q}'))::numeric, 4) AS keyword_score,\n"
+        "    ROUND((0.82 * (1 - (c.embedding <=> ...::vector)) + 0.18 * LEAST(ts_rank_cd(...), 1.0))::numeric, 4) AS hybrid_score\n"
+        'FROM "docprocessing".document_chunks c\n'
+        'JOIN "docprocessing".documents d ON d.id = c.document_id\n'
+        f"WHERE ({doc_filter_sql}::integer IS NULL OR c.document_id = {doc_filter_sql}::integer)\n"
+        "ORDER BY hybrid_score DESC, c.embedding <=> ...::vector ASC\n"
+        f"LIMIT {top_k};"
+    )
+
+    return rows, sql_proof
+
+
+def list_documents(settings: Settings) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    """Lists all indexed PDF documents and aggregate KPI totals from AlloyDB."""
+    select_sql = """
+        SELECT
+            id,
+            title,
+            filename,
+            page_count,
+            chunk_count,
+            source_gcs_uri,
+            output_gcs_uri,
+            processed_at
+        FROM "docprocessing".documents
+        ORDER BY processed_at DESC, id DESC;
+    """.strip()
+
+    summary_sql = """
+        SELECT
+            COUNT(*)::int AS document_count,
+            COALESCE(SUM(chunk_count), 0)::int AS total_chunks,
+            COALESCE(SUM(page_count), 0)::int AS total_pages
+        FROM "docprocessing".documents;
+    """.strip()
+
+    conn = get_connection(settings)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(select_sql)
+            rows = [_serialize_row(dict(r)) for r in cur.fetchall()]
             cur.execute(summary_sql)
             raw_summary = dict(cur.fetchone() or {})
     except psycopg2.Error as exc:
-        raise DatabaseServiceError(f"Failed to query records from AlloyDB: {exc}") from exc
+        raise DatabaseServiceError(f"Failed to list indexed documents in AlloyDB: {exc}") from exc
     finally:
         conn.close()
 
     summary = {
-        "total": int(raw_summary.get("total") or 0),
-        "valid": int(raw_summary.get("valid") or 0),
-        "expiring_soon": int(raw_summary.get("expiring_soon") or 0),
-        "expired": int(raw_summary.get("expired") or 0),
-        "avg_confidence": (
-            float(raw_summary["avg_confidence"])
-            if raw_summary.get("avg_confidence") is not None
-            else None
-        ),
+        "document_count": int(raw_summary.get("document_count") or 0),
+        "total_chunks": int(raw_summary.get("total_chunks") or 0),
+        "total_pages": int(raw_summary.get("total_pages") or 0),
+        "embedding_dimensions": settings.EMBEDDING_DIMENSIONS,
     }
-
     return rows, summary, select_sql
 
 
-def delete_license_record(settings: Settings, record_id: int) -> bool:
-    """Deletes a record by primary key from AlloyDB. Returns True if a row was deleted."""
+def get_document_chunks(settings: Settings, document_id: int) -> list[dict[str, Any]]:
+    """Fetches stored layout chunks for a document without exposing raw 768-float arrays."""
+    query_sql = """
+        SELECT
+            id,
+            document_id,
+            chunk_index,
+            page_start,
+            page_end,
+            section_heading,
+            content,
+            token_estimate,
+            vector_dims(embedding) AS embedding_dims,
+            created_at
+        FROM "docprocessing".document_chunks
+        WHERE document_id = %s
+        ORDER BY chunk_index ASC;
+    """.strip()
+
+    conn = get_connection(settings)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query_sql, (document_id,))
+            return [_serialize_row(dict(r)) for r in cur.fetchall()]
+    except psycopg2.Error as exc:
+        raise DatabaseServiceError(
+            f"Failed to load chunks for document {document_id}: {exc}"
+        ) from exc
+    finally:
+        conn.close()
+
+
+def delete_document(settings: Settings, document_id: int) -> bool:
+    """Deletes a document and its cascading vector chunks by ID."""
     conn = get_connection(settings)
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    'DELETE FROM "docprocessing".driverslicense WHERE id = %s RETURNING id;',
-                    (record_id,),
+                    'DELETE FROM "docprocessing".documents WHERE id = %s RETURNING id;',
+                    (document_id,),
                 )
                 return cur.fetchone() is not None
     except psycopg2.Error as exc:
-        raise DatabaseServiceError(f"Failed to delete record {record_id}: {exc}") from exc
+        raise DatabaseServiceError(f"Failed to delete document {document_id}: {exc}") from exc
     finally:
         conn.close()

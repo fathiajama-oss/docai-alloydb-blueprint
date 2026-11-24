@@ -3,25 +3,17 @@
 
 const state = {
   samples: [],
+  documents: [],
   health: null,
-  activeStatusFilter: "",
-  activeSearch: "",
-  activeResult: null,
-  latestSqlProof: "-- Process or query records to inspect live SQL statements.",
+  chatHistory: [],
+  activeCitations: [],
+  activeIngestion: null,
+  latestSqlProof: "-- Ingest a PDF or ask a question to inspect live SQL statements.",
   ddlSql: "",
+  busy: false,
 };
 
-const FIELD_LABELS = [
-  { key: "dl_number", label: "DL Number" },
-  { key: "given_name", label: "Given Name" },
-  { key: "surname", label: "Surname" },
-  { key: "address", label: "Address" },
-  { key: "dob", label: "Date of Birth" },
-  { key: "issue_date", label: "Issue Date" },
-  { key: "expiration_date", label: "Expiration Date" },
-];
-
-const PIPELINE_STEPS = ["gcs_upload", "docai_parse", "gcs_json_write", "alloydb_write"];
+const PIPELINE_STEPS = ["gcs_upload", "docai_parse", "embedding", "alloydb_write"];
 
 function escapeHtml(value) {
   if (value === null || value === undefined) return "";
@@ -33,16 +25,106 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
-function formatStatusLabel(status) {
-  if (status === "VALID") return "Valid";
-  if (status === "EXPIRING_SOON") return "Expiring Soon";
-  if (status === "EXPIRED") return "Expired";
-  return status || "Unknown";
+function formatInlineMarkdown(rawText) {
+  let safe = escapeHtml(rawText);
+  safe = safe.replace(/\*\*([^*]+)\*\*/g, (_, inner) => `<strong>${inner}</strong>`);
+  safe = safe.replace(/`([^`]+)`/g, (_, code) => `<code class="mono">${code}</code>`);
+  safe = safe.replace(
+    /\[(\d+)\]/g,
+    (_, num) => `<button type="button" class="citation-pill" data-citation="${num}">[${num}]</button>`
+  );
+  return safe;
 }
 
-function formatConfidence(val) {
-  if (val === null || val === undefined || Number.isNaN(Number(val))) return "--";
-  return `${(Number(val) * 100).toFixed(1)}%`;
+function renderMarkdownAnswer(markdown) {
+  const lines = String(markdown || "").replace(/\r\n/g, "\n").split("\n");
+  const html = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (!line) {
+      i += 1;
+      continue;
+    }
+
+    // Compact Markdown table detection
+    if (line.startsWith("|") && i + 1 < lines.length && /^\|\s*[-:]+/.test(lines[i + 1].trim())) {
+      const headerCells = line
+        .split("|")
+        .slice(1, -1)
+        .map((c) => c.trim());
+      i += 2;
+      const bodyRows = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        const rowCells = lines[i]
+          .trim()
+          .split("|")
+          .slice(1, -1)
+          .map((c) => c.trim());
+        bodyRows.push(rowCells);
+        i += 1;
+      }
+      html.push(
+        `<table class="chat-md-table"><thead><tr>${headerCells
+          .map((h) => `<th>${formatInlineMarkdown(h)}</th>`)
+          .join("")}</tr></thead><tbody>${bodyRows
+          .map(
+            (r) =>
+              `<tr>${r.map((c) => `<td>${formatInlineMarkdown(c)}</td>`).join("")}</tr>`
+          )
+          .join("")}</tbody></table>`
+      );
+      continue;
+    }
+
+    // Bullet list
+    if (/^[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^[-*]\s+/, ""));
+        i += 1;
+      }
+      html.push(`<ul>${items.map((it) => `<li>${formatInlineMarkdown(it)}</li>`).join("")}</ul>`);
+      continue;
+    }
+
+    // Numbered list
+    if (/^\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^\d+\.\s+/, ""));
+        i += 1;
+      }
+      html.push(`<ol>${items.map((it) => `<li>${formatInlineMarkdown(it)}</li>`).join("")}</ol>`);
+      continue;
+    }
+
+    // Heading
+    if (/^#{1,4}\s+/.test(line)) {
+      const text = line.replace(/^#{1,4}\s+/, "");
+      html.push(`<p><strong>${formatInlineMarkdown(text)}</strong></p>`);
+      i += 1;
+      continue;
+    }
+
+    // Paragraph block
+    const paraLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !lines[i].trim().startsWith("|") &&
+      !/^[-*]\s+/.test(lines[i].trim()) &&
+      !/^\d+\.\s+/.test(lines[i].trim()) &&
+      !/^#{1,4}\s+/.test(lines[i].trim())
+    ) {
+      paraLines.push(lines[i].trim());
+      i += 1;
+    }
+    html.push(`<p>${formatInlineMarkdown(paraLines.join(" "))}</p>`);
+  }
+
+  return html.join("");
 }
 
 function setPipelineNode(stepKey, status, metaText) {
@@ -52,32 +134,29 @@ function setPipelineNode(stepKey, status, metaText) {
   if (!node || !badge || !meta) return;
 
   node.classList.remove("is-running", "is-done", "is-error");
-  if (status === "RUNNING") {
-    node.classList.add("is-running");
-  } else if (status === "DONE") {
-    node.classList.add("is-done");
-  } else if (status === "ERROR") {
-    node.classList.add("is-error");
-  }
+  if (status === "RUNNING") node.classList.add("is-running");
+  else if (status === "DONE") node.classList.add("is-done");
+  else if (status === "ERROR") node.classList.add("is-error");
+
   badge.textContent = status;
   if (metaText) meta.textContent = metaText;
 }
 
 function resetPipelineStrip() {
-  setPipelineNode("gcs_upload", "IDLE", "Raw document upload");
-  setPipelineNode("docai_parse", "IDLE", "Entity & box extraction");
-  setPipelineNode("gcs_json_write", "IDLE", "Cloud Storage archival");
-  setPipelineNode("alloydb_write", "IDLE", "Relational commit");
+  setPipelineNode("gcs_upload", "IDLE", "Raw PDF staging");
+  setPipelineNode("docai_parse", "IDLE", "Structure & table chunking");
+  setPipelineNode("embedding", "IDLE", "Dense document embeddings");
+  setPipelineNode("alloydb_write", "IDLE", "HNSW vector persistence");
   document.getElementById("pipelineTotalTime").textContent = "Ready";
 }
 
 let pipelineAnimTimer = null;
 
-function startPipelineAnimation() {
+function startPipelineAnimation(label = "Executing live pipeline...") {
   stopPipelineAnimation();
   resetPipelineStrip();
-  document.getElementById("pipelineTotalTime").textContent = "Executing live pipeline...";
-  setPipelineNode("gcs_upload", "RUNNING", "Uploading to Cloud Storage...");
+  document.getElementById("pipelineTotalTime").textContent = label;
+  setPipelineNode("gcs_upload", "RUNNING", "Uploading PDF to Cloud Storage...");
 
   let idx = 0;
   pipelineAnimTimer = setInterval(() => {
@@ -86,7 +165,7 @@ function startPipelineAnimation() {
       idx += 1;
       setPipelineNode(PIPELINE_STEPS[idx], "RUNNING", "In progress...");
     }
-  }, 550);
+  }, 650);
 }
 
 function stopPipelineAnimation() {
@@ -100,7 +179,7 @@ function applyPipelineSuccessTimings(timings) {
   stopPipelineAnimation();
   setPipelineNode("gcs_upload", "DONE", `${timings.gcs_upload_ms ?? 0} ms`);
   setPipelineNode("docai_parse", "DONE", `${timings.docai_parse_ms ?? 0} ms`);
-  setPipelineNode("gcs_json_write", "DONE", `${timings.gcs_json_write_ms ?? 0} ms`);
+  setPipelineNode("embedding", "DONE", `${timings.embedding_ms ?? 0} ms`);
   setPipelineNode("alloydb_write", "DONE", `${timings.alloydb_write_ms ?? 0} ms`);
   document.getElementById("pipelineTotalTime").textContent = `Total: ${timings.total_ms ?? 0} ms`;
 }
@@ -111,7 +190,8 @@ function applyPipelineErrorStage(stage) {
     config: "gcs_upload",
     gcs_upload: "gcs_upload",
     docai_parse: "docai_parse",
-    gcs_download: "gcs_json_write",
+    gcs_download: "docai_parse",
+    vertex_embed: "embedding",
     alloydb_persist: "alloydb_write",
   };
   const failedStep = stageMap[stage] || "gcs_upload";
@@ -164,17 +244,27 @@ function updateProofDrawerContent() {
   document.getElementById("proofDdlSql").textContent =
     state.ddlSql || "-- Schema DDL loaded from sql/01_init_schema.sql";
 
-  if (state.activeResult) {
+  if (state.activeIngestion) {
     document.getElementById("proofSourceUri").textContent =
-      state.activeResult.source_gcs_uri || "N/A";
+      state.activeIngestion.source_gcs_uri || "N/A";
     document.getElementById("proofOutputUri").textContent =
-      state.activeResult.output_gcs_uri || "N/A";
+      state.activeIngestion.output_gcs_uri || "N/A";
     document.getElementById("proofRawJson").textContent = JSON.stringify(
-      state.activeResult.raw_docai_json || {},
+      state.activeIngestion.raw_docai_json || {},
       null,
       2
     );
   }
+}
+
+function setControlsDisabled(disabled) {
+  state.busy = disabled;
+  document.querySelectorAll(".ingest-sample-btn").forEach((btn) => {
+    btn.disabled = disabled;
+  });
+  document.getElementById("browseFileBtn").disabled = disabled;
+  document.getElementById("ingestAllBtn").disabled = disabled;
+  document.getElementById("askBtn").disabled = disabled;
 }
 
 async function fetchHealth() {
@@ -223,7 +313,8 @@ function renderHealthPanel(components) {
   const grid = document.getElementById("healthGrid");
   const entries = [
     { key: "cloud_storage", title: "Cloud Storage" },
-    { key: "document_ai", title: "Document AI" },
+    { key: "document_ai", title: "Document AI Layout Parser" },
+    { key: "vertex_ai", title: "Vertex AI & Gemini" },
     { key: "alloydb", title: "AlloyDB for PostgreSQL" },
   ];
 
@@ -260,135 +351,38 @@ async function fetchSamples() {
       .map(
         (sample) => `
         <article class="card sample-card">
-          <div class="sample-thumb-wrap">
-            <img class="sample-thumb" src="${escapeHtml(sample.preview_url)}" alt="${escapeHtml(sample.title)}" loading="lazy" />
+          <div class="sample-top-row">
+            <span class="sample-category">${escapeHtml(sample.category)}</span>
+            <span class="sample-pages mono">${escapeHtml(sample.pages)} pages</span>
           </div>
-          <div class="sample-body">
-            <div class="sample-top-row">
-              <span class="sample-state">${escapeHtml(sample.state)}</span>
-              <span class="compliance-badge compliance-${escapeHtml(sample.expected_status)}">${escapeHtml(formatStatusLabel(sample.expected_status))}</span>
-            </div>
-            <div class="sample-title">${escapeHtml(sample.holder_name)}</div>
-            <div class="sample-meta mono">ID ${escapeHtml(sample.dl_number)} &middot; ${escapeHtml(sample.expiration_label)}</div>
-            <div class="sample-actions">
-              <button class="btn btn-primary btn-sm process-sample-btn" data-filename="${escapeHtml(sample.filename)}" type="button">
-                Process Document
-              </button>
-            </div>
+          <div class="sample-title">${escapeHtml(sample.title)}</div>
+          <p class="sample-summary">${escapeHtml(sample.summary)}</p>
+          <div class="sample-actions">
+            <a class="btn btn-secondary btn-sm" href="${escapeHtml(sample.pdf_url)}" target="_blank" rel="noopener">Open PDF</a>
+            <button class="btn btn-primary btn-sm ingest-sample-btn" data-filename="${escapeHtml(sample.filename)}" type="button">
+              Ingest &amp; Vectorize
+            </button>
           </div>
         </article>
       `
       )
       .join("");
 
-    document.querySelectorAll(".process-sample-btn").forEach((btn) => {
-      btn.addEventListener("click", () => processSample(btn.dataset.filename));
+    document.querySelectorAll(".ingest-sample-btn").forEach((btn) => {
+      btn.addEventListener("click", () => ingestSample(btn.dataset.filename));
     });
   } catch (err) {
-    grid.innerHTML = `<div class="card empty-state">Unable to load sample documents: ${escapeHtml(err.message)}</div>`;
+    grid.innerHTML = `<div class="card empty-state">Unable to load sample PDFs: ${escapeHtml(err.message)}</div>`;
   }
 }
 
-function highlightFieldAndBox(fieldName) {
-  document.querySelectorAll(".field-item").forEach((el) => {
-    el.classList.toggle("is-active", Boolean(fieldName) && el.dataset.field === fieldName);
-  });
-  document.querySelectorAll(".bbox-poly").forEach((el) => {
-    el.classList.toggle("is-active", Boolean(fieldName) && el.dataset.field === fieldName);
-  });
-}
-
-function renderVerificationWorkspace(result, previewObjectUrl = null) {
-  state.activeResult = result;
-  if (result.sql_proof) state.latestSqlProof = result.sql_proof;
-  if (result.ddl_sql) state.ddlSql = result.ddl_sql;
-  updateProofDrawerContent();
-
-  document.getElementById("verificationEmpty").classList.add("hidden");
-  document.getElementById("verificationWorkspace").classList.remove("hidden");
-  document.getElementById("activeResultBadges").classList.remove("hidden");
-
-  const rec = result.record || {};
-  document.getElementById("viewerFilename").textContent = result.filename || "processed_document";
-  document.getElementById("activeConfidenceBadge").textContent = `Confidence: ${formatConfidence(rec.avg_confidence)}`;
-
-  const statusBadge = document.getElementById("activeStatusBadge");
-  statusBadge.className = `compliance-badge compliance-${rec.compliance_status || "UNKNOWN"}`;
-  statusBadge.textContent = formatStatusLabel(rec.compliance_status);
-
-  const imgEl = document.getElementById("documentPreviewImg");
-  const svgEl = document.getElementById("bboxOverlay");
-  const pdfEl = document.getElementById("pdfPlaceholder");
-
-  if (result.mime_type === "application/pdf") {
-    imgEl.classList.add("hidden");
-    svgEl.classList.add("hidden");
-    pdfEl.classList.remove("hidden");
-  } else {
-    pdfEl.classList.add("hidden");
-    imgEl.classList.remove("hidden");
-    svgEl.classList.remove("hidden");
-    imgEl.src = previewObjectUrl || `/api/samples/${encodeURIComponent(result.filename)}`;
-
-    const entities = result.entities_with_boxes || [];
-    svgEl.innerHTML = entities
-      .filter((ent) => Array.isArray(ent.bounding_poly) && ent.bounding_poly.length >= 3)
-      .map((ent) => {
-        const points = ent.bounding_poly
-          .map((pt) => `${Number(pt.x) || 0},${Number(pt.y) || 0}`)
-          .join(" ");
-        return `<polygon class="bbox-poly" data-field="${escapeHtml(ent.field)}" points="${points}"></polygon>`;
-      })
-      .join("");
-
-    svgEl.querySelectorAll(".bbox-poly").forEach((poly) => {
-      poly.addEventListener("mouseenter", () => highlightFieldAndBox(poly.dataset.field));
-      poly.addEventListener("mouseleave", () => highlightFieldAndBox(null));
-    });
-  }
-
-  const boxMap = new Map();
-  (result.entities_with_boxes || []).forEach((item) => {
-    boxMap.set(item.field, item);
-  });
-
-  document.getElementById("fieldsCountLabel").textContent = `${boxMap.size} mapped fields`;
-  const listEl = document.getElementById("extractedFieldsList");
-  listEl.innerHTML = FIELD_LABELS.map(({ key, label }) => {
-    const ent = boxMap.get(key);
-    const val = rec[key] ?? (ent ? ent.cleaned_value : null) ?? "Not detected";
-    const conf = ent ? formatConfidence(ent.confidence) : "--";
-    return `
-      <div class="field-item" data-field="${escapeHtml(key)}">
-        <div class="field-item-top">
-          <span class="field-label">${escapeHtml(label)}</span>
-          <span class="field-confidence mono">${escapeHtml(conf)}</span>
-        </div>
-        <div class="field-value">${escapeHtml(val)}</div>
-      </div>
-    `;
-  }).join("");
-
-  listEl.querySelectorAll(".field-item").forEach((item) => {
-    item.addEventListener("mouseenter", () => highlightFieldAndBox(item.dataset.field));
-    item.addEventListener("mouseleave", () => highlightFieldAndBox(null));
-  });
-}
-
-function setSampleButtonsDisabled(disabled) {
-  document.querySelectorAll(".process-sample-btn").forEach((btn) => {
-    btn.disabled = disabled;
-  });
-  document.getElementById("browseFileBtn").disabled = disabled;
-}
-
-async function processSample(filename) {
+async function ingestSample(filename, preserveControls = false) {
   hideErrorBanner();
-  setSampleButtonsDisabled(true);
-  startPipelineAnimation();
+  if (!preserveControls) setControlsDisabled(true);
+  startPipelineAnimation(`Ingesting ${filename}...`);
 
   try {
-    const resp = await fetch(`/api/process/sample/${encodeURIComponent(filename)}`, {
+    const resp = await fetch(`/api/documents/sample/${encodeURIComponent(filename)}`, {
       method: "POST",
     });
     const data = await resp.json();
@@ -396,35 +390,53 @@ async function processSample(filename) {
       const detail = data.detail || {};
       applyPipelineErrorStage(detail.stage || "config");
       showErrorBanner(
-        `Pipeline Stopped (${detail.stage || "error"})`,
-        detail.message || data.detail || "Unable to process sample document."
+        `Ingestion Stopped (${detail.stage || "error"})`,
+        detail.message || data.detail || "Unable to ingest sample PDF."
       );
-      return;
+      return false;
     }
 
+    state.activeIngestion = data;
+    if (data.sql_proof) state.latestSqlProof = data.sql_proof;
+    if (data.ddl_sql) state.ddlSql = data.ddl_sql;
+    updateProofDrawerContent();
     applyPipelineSuccessTimings(data.timings || {});
-    renderVerificationWorkspace(data, `/api/samples/${encodeURIComponent(filename)}`);
-    await fetchRecords();
+    await fetchDocuments();
+    return true;
   } catch (err) {
     applyPipelineErrorStage("gcs_upload");
     showErrorBanner("Network Error", err.message);
+    return false;
   } finally {
-    setSampleButtonsDisabled(false);
+    if (!preserveControls) setControlsDisabled(false);
   }
 }
 
-async function processUpload(file) {
+async function ingestAllSamples() {
+  if (!state.samples.length) return;
+  hideErrorBanner();
+  setControlsDisabled(true);
+  try {
+    for (const sample of state.samples) {
+      const ok = await ingestSample(sample.filename, true);
+      if (!ok) break;
+    }
+  } finally {
+    setControlsDisabled(false);
+  }
+}
+
+async function ingestUpload(file) {
   if (!file) return;
   hideErrorBanner();
-  setSampleButtonsDisabled(true);
-  startPipelineAnimation();
+  setControlsDisabled(true);
+  startPipelineAnimation(`Ingesting ${file.name}...`);
 
-  const previewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : null;
   const formData = new FormData();
   formData.append("file", file);
 
   try {
-    const resp = await fetch("/api/process/upload", {
+    const resp = await fetch("/api/documents/upload", {
       method: "POST",
       body: formData,
     });
@@ -433,116 +445,340 @@ async function processUpload(file) {
       const detail = data.detail || {};
       applyPipelineErrorStage(detail.stage || "config");
       showErrorBanner(
-        `Pipeline Stopped (${detail.stage || "error"})`,
-        detail.message || data.detail || "Unable to process uploaded document."
+        `Upload Stopped (${detail.stage || "error"})`,
+        detail.message || data.detail || "Unable to ingest uploaded PDF."
       );
       return;
     }
 
+    state.activeIngestion = data;
+    if (data.sql_proof) state.latestSqlProof = data.sql_proof;
+    if (data.ddl_sql) state.ddlSql = data.ddl_sql;
+    updateProofDrawerContent();
     applyPipelineSuccessTimings(data.timings || {});
-    renderVerificationWorkspace(data, previewUrl);
-    await fetchRecords();
+    await fetchDocuments();
   } catch (err) {
     applyPipelineErrorStage("gcs_upload");
     showErrorBanner("Upload Failed", err.message);
   } finally {
-    setSampleButtonsDisabled(false);
+    setControlsDisabled(false);
   }
 }
 
-async function fetchRecords() {
-  const noticeEl = document.getElementById("recordsStatusBanner");
-  const listEl = document.getElementById("recordsList");
-  const params = new URLSearchParams();
-  if (state.activeStatusFilter) params.set("status", state.activeStatusFilter);
-  if (state.activeSearch.trim()) params.set("search", state.activeSearch.trim());
+function updateScopeDropdown(documents) {
+  const select = document.getElementById("chatScopeSelect");
+  const prevValue = select.value;
+  select.innerHTML = `<option value="">All Indexed Documents</option>`;
+  documents.forEach((doc) => {
+    const opt = document.createElement("option");
+    opt.value = String(doc.id);
+    opt.textContent = `${doc.title} (${doc.page_count}p / ${doc.chunk_count} chunks)`;
+    select.appendChild(opt);
+  });
+  if ([...select.options].some((o) => o.value === prevValue)) {
+    select.value = prevValue;
+  }
+}
+
+async function fetchDocuments() {
+  const noticeEl = document.getElementById("documentsStatusBanner");
+  const listEl = document.getElementById("documentsList");
 
   try {
-    const resp = await fetch(`/api/records?${params.toString()}`);
+    const resp = await fetch("/api/documents");
     const data = await resp.json();
 
     if (!resp.ok) {
       const detail = data.detail || {};
-      noticeEl.textContent = `AlloyDB ledger unavailable: ${detail.message || "Check connection or start AlloyDB Auth Proxy."}`;
+      noticeEl.textContent = `AlloyDB knowledge base unavailable: ${detail.message || "Check connection or start AlloyDB Auth Proxy."}`;
       noticeEl.classList.remove("hidden");
       listEl.innerHTML = "";
       return;
     }
 
     noticeEl.classList.add("hidden");
+    const docs = data.documents || [];
     const summary = data.summary || {};
-    document.getElementById("kpiTotal").textContent = summary.total ?? 0;
-    document.getElementById("kpiValid").textContent = summary.valid ?? 0;
-    document.getElementById("kpiExpiring").textContent = summary.expiring_soon ?? 0;
-    document.getElementById("kpiExpired").textContent = summary.expired ?? 0;
-    document.getElementById("kpiConfidence").textContent = formatConfidence(summary.avg_confidence);
+    state.documents = docs;
 
-    if (data.sql_proof && !state.activeResult) {
+    document.getElementById("kpiDocs").textContent = summary.document_count ?? 0;
+    document.getElementById("kpiChunks").textContent = summary.total_chunks ?? 0;
+    document.getElementById("kpiPages").textContent = summary.total_pages ?? 0;
+
+    updateScopeDropdown(docs);
+
+    if (data.sql_proof && !state.activeIngestion && state.chatHistory.length === 0) {
       state.latestSqlProof = data.sql_proof;
     }
-    if (data.ddl_sql) {
-      state.ddlSql = data.ddl_sql;
-    }
+    if (data.ddl_sql) state.ddlSql = data.ddl_sql;
     updateProofDrawerContent();
 
-    const rows = data.records || [];
-    if (rows.length === 0) {
+    if (docs.length === 0) {
       listEl.innerHTML = `
         <div class="card empty-state">
-          <p class="empty-title">No matching records in AlloyDB</p>
-          <p class="empty-copy">Process a driver's license above or adjust your search and filter criteria.</p>
+          <p class="empty-title">No indexed PDFs in AlloyDB yet</p>
+          <p class="empty-copy">Click Ingest &amp; Vectorize on a sample PDF above or upload your own PDF to populate the vector store.</p>
         </div>
       `;
       return;
     }
 
-    listEl.innerHTML = rows
+    const sampleSet = new Set(state.samples.map((s) => s.filename));
+    listEl.innerHTML = docs
       .map(
-        (row) => `
-        <article class="card record-row">
-          <div>
-            <div class="record-name">${escapeHtml(row.given_name || "")} ${escapeHtml(row.surname || "")}</div>
-            <div class="record-sub">${escapeHtml(row.address || "Address unavailable")}</div>
+        (doc) => `
+        <article class="card doc-card" data-doc-id="${escapeHtml(doc.id)}">
+          <div class="record-row">
+            <div>
+              <div class="record-name">${escapeHtml(doc.title)}</div>
+              <div class="record-sub mono">${escapeHtml(doc.filename)} &middot; ${escapeHtml(doc.source_gcs_uri)}</div>
+            </div>
+            <div>
+              <div class="record-meta-label">Pages &amp; Chunks</div>
+              <div class="record-meta-val mono">${escapeHtml(doc.page_count)} pages &middot; ${escapeHtml(doc.chunk_count)} chunks</div>
+            </div>
+            <div>
+              <div class="record-meta-label">Indexed At</div>
+              <div class="record-meta-val mono">${escapeHtml(String(doc.processed_at || "").replace("T", " ").slice(0, 19))}</div>
+            </div>
+            <div class="record-actions">
+              ${
+                sampleSet.has(doc.filename)
+                  ? `<a class="btn btn-secondary btn-xs" href="/api/samples/${encodeURIComponent(doc.filename)}" target="_blank" rel="noopener">Open PDF</a>`
+                  : ""
+              }
+              <button class="btn btn-secondary btn-xs inspect-chunks-btn" data-id="${escapeHtml(doc.id)}" type="button">Inspect Chunks</button>
+              <button class="btn btn-secondary btn-xs delete-doc-btn" data-id="${escapeHtml(doc.id)}" type="button">Delete</button>
+            </div>
           </div>
-          <div>
-            <div class="record-meta-label">License Number</div>
-            <div class="record-meta-val mono">${escapeHtml(row.dl_number || "--")}</div>
-          </div>
-          <div>
-            <div class="record-meta-label">Dates (DOB / ISS / EXP)</div>
-            <div class="record-meta-val mono">${escapeHtml(row.dob || "--")} &middot; ${escapeHtml(row.issue_date || "--")} &middot; ${escapeHtml(row.expiration_date || "--")}</div>
-          </div>
-          <div>
-            <span class="compliance-badge compliance-${escapeHtml(row.compliance_status)}">${escapeHtml(formatStatusLabel(row.compliance_status))}</span>
-            <div class="record-sub mono">Conf: ${escapeHtml(formatConfidence(row.avg_confidence))}</div>
-          </div>
-          <div class="record-actions">
-            <button class="btn btn-secondary btn-xs delete-record-btn" data-id="${escapeHtml(row.id)}" type="button">Delete</button>
-          </div>
+          <div id="chunks-drawer-${escapeHtml(doc.id)}" class="chunks-drawer hidden"></div>
         </article>
       `
       )
       .join("");
 
-    listEl.querySelectorAll(".delete-record-btn").forEach((btn) => {
-      btn.addEventListener("click", () => deleteRecord(btn.dataset.id));
+    listEl.querySelectorAll(".inspect-chunks-btn").forEach((btn) => {
+      btn.addEventListener("click", () => toggleDocumentChunks(btn.dataset.id, btn));
+    });
+
+    listEl.querySelectorAll(".delete-doc-btn").forEach((btn) => {
+      btn.addEventListener("click", () => deleteDocumentRecord(btn.dataset.id));
     });
   } catch (err) {
-    noticeEl.textContent = `Unable to query AlloyDB records: ${err.message}`;
+    noticeEl.textContent = `Unable to query indexed documents: ${err.message}`;
     noticeEl.classList.remove("hidden");
   }
 }
 
-async function deleteRecord(recordId) {
+async function toggleDocumentChunks(docId, btn) {
+  const drawer = document.getElementById(`chunks-drawer-${docId}`);
+  if (!drawer) return;
+  if (!drawer.classList.contains("hidden")) {
+    drawer.classList.add("hidden");
+    btn.textContent = "Inspect Chunks";
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "Loading...";
   try {
-    const resp = await fetch(`/api/records/${encodeURIComponent(recordId)}`, {
+    const resp = await fetch(`/api/documents/${encodeURIComponent(docId)}/chunks`);
+    const data = await resp.json();
+    if (!resp.ok) {
+      showErrorBanner("Chunk Inspection Failed", data.detail?.message || "Unable to fetch chunks.");
+      return;
+    }
+    const chunks = data.chunks || [];
+    drawer.innerHTML = chunks
+      .map(
+        (ch) => `
+        <div class="chunk-preview-item">
+          <div class="chunk-preview-top">
+            <strong>#${escapeHtml(ch.chunk_index + 1)} &middot; ${escapeHtml(ch.section_heading || "Document Section")}</strong>
+            <span class="mono">Page ${escapeHtml(ch.page_start)}${ch.page_end !== ch.page_start ? `-${escapeHtml(ch.page_end)}` : ""} &middot; ${escapeHtml(ch.embedding_dims)}-d vector</span>
+          </div>
+          <pre class="chunk-preview-body">${escapeHtml(ch.content)}</pre>
+        </div>
+      `
+      )
+      .join("");
+    drawer.classList.remove("hidden");
+    btn.textContent = "Hide Chunks";
+  } catch (err) {
+    showErrorBanner("Chunk Inspection Failed", err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteDocumentRecord(docId) {
+  try {
+    const resp = await fetch(`/api/documents/${encodeURIComponent(docId)}`, {
       method: "DELETE",
     });
     if (resp.ok) {
-      await fetchRecords();
+      await fetchDocuments();
     }
   } catch (err) {
     showErrorBanner("Delete Failed", err.message);
+  }
+}
+
+function highlightEvidenceCard(citationIdx) {
+  document.querySelectorAll(".evidence-card").forEach((card) => {
+    const isMatch = Boolean(citationIdx) && Number(card.dataset.citation) === Number(citationIdx);
+    card.classList.toggle("is-highlighted", isMatch);
+    if (isMatch) {
+      card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  });
+}
+
+function renderEvidenceList(citations) {
+  state.activeCitations = citations || [];
+  const listEl = document.getElementById("evidenceList");
+  const countEl = document.getElementById("evidenceCountPill");
+  countEl.textContent = `${state.activeCitations.length} chunk${state.activeCitations.length === 1 ? "" : "s"}`;
+
+  if (state.activeCitations.length === 0) {
+    listEl.innerHTML = `<div class="empty-state-compact">No matching chunks retrieved from AlloyDB for this query.</div>`;
+    return;
+  }
+
+  listEl.innerHTML = state.activeCitations
+    .map((cit) => {
+      const simPct = (Number(cit.vector_similarity || 0) * 100).toFixed(1);
+      const pageLabel =
+        cit.page_start === cit.page_end
+          ? `Page ${cit.page_start}`
+          : `Pages ${cit.page_start}-${cit.page_end}`;
+      return `
+        <article class="evidence-card" data-citation="${escapeHtml(cit.citation_index)}">
+          <div class="evidence-card-top">
+            <div class="evidence-title-wrap">
+              <span class="evidence-idx mono">[${escapeHtml(cit.citation_index)}]</span>
+              <span class="evidence-doc-title">${escapeHtml(cit.document_title)}</span>
+            </div>
+            <span class="sim-badge mono">${escapeHtml(simPct)}% Cosine Match</span>
+          </div>
+          <div class="evidence-meta mono">
+            ${escapeHtml(pageLabel)} &middot; ${escapeHtml(cit.section_heading || "General Section")} &middot; Hybrid ${escapeHtml(Number(cit.hybrid_score || 0).toFixed(3))}
+          </div>
+          <pre class="evidence-content">${escapeHtml(cit.content)}</pre>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderChatMessages() {
+  const container = document.getElementById("chatMessages");
+  if (state.chatHistory.length === 0) {
+    container.innerHTML = `
+      <div class="chat-empty">
+        <p class="chat-empty-title">Ready for grounded document Q&amp;A</p>
+        <p class="chat-empty-copy">
+          Ingest at least one PDF in Step 01, then click a starter prompt above or ask your own question below.
+        </p>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = state.chatHistory
+    .map((turn) => {
+      if (turn.role === "user") {
+        return `<div class="chat-bubble chat-bubble-user">${escapeHtml(turn.content)}</div>`;
+      }
+      const t = turn.timings || {};
+      const latencyNote = t.alloydb_search_ms !== undefined
+        ? `Vector SQL: ${t.alloydb_search_ms} ms &middot; Gemini: ${t.gemini_generate_ms} ms`
+        : "";
+      return `
+        <div class="chat-bubble chat-bubble-assistant">
+          <div class="chat-answer-body">${renderMarkdownAnswer(turn.content)}</div>
+          ${
+            latencyNote
+              ? `<div class="chat-bubble-meta mono"><span>Grounded in ${escapeHtml((turn.citations || []).length)} AlloyDB chunk(s)</span><span>${latencyNote}</span></div>`
+              : ""
+          }
+        </div>
+      `;
+    })
+    .join("");
+
+  container.querySelectorAll(".citation-pill").forEach((pill) => {
+    pill.addEventListener("mouseenter", () => highlightEvidenceCard(pill.dataset.citation));
+    pill.addEventListener("click", () => highlightEvidenceCard(pill.dataset.citation));
+  });
+
+  container.scrollTop = container.scrollHeight;
+}
+
+async function submitChatQuestion(rawQuestion) {
+  const question = String(rawQuestion || "").trim();
+  if (!question || state.busy) return;
+
+  hideErrorBanner();
+  const scopeVal = document.getElementById("chatScopeSelect").value;
+  const documentId = scopeVal ? Number(scopeVal) : null;
+
+  const priorTurns = state.chatHistory.map((t) => ({
+    role: t.role,
+    content: t.content,
+  }));
+
+  state.chatHistory.push({ role: "user", content: question });
+  renderChatMessages();
+  document.getElementById("chatInput").value = "";
+  setControlsDisabled(true);
+
+  const askBtn = document.getElementById("askBtn");
+  const originalLabel = askBtn.textContent;
+  askBtn.textContent = "Searching...";
+
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question,
+        document_id: documentId,
+        top_k: 5,
+        history: priorTurns,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      const detail = data.detail || {};
+      showErrorBanner(
+        `Chat Request Failed (${detail.stage || "error"})`,
+        detail.message || data.detail || "Unable to query AlloyDB or Gemini."
+      );
+      state.chatHistory.pop();
+      renderChatMessages();
+      return;
+    }
+
+    if (data.sql_proof) state.latestSqlProof = data.sql_proof;
+    if (data.ddl_sql) state.ddlSql = data.ddl_sql;
+    updateProofDrawerContent();
+
+    state.chatHistory.push({
+      role: "assistant",
+      content: data.answer,
+      citations: data.citations || [],
+      timings: data.timings || {},
+    });
+    renderChatMessages();
+    renderEvidenceList(data.citations || []);
+  } catch (err) {
+    showErrorBanner("Chat Request Failed", err.message);
+    state.chatHistory.pop();
+    renderChatMessages();
+  } finally {
+    askBtn.textContent = originalLabel;
+    setControlsDisabled(false);
   }
 }
 
@@ -555,7 +791,7 @@ async function initializeSchema() {
       return;
     }
     await fetchHealth();
-    await fetchRecords();
+    await fetchDocuments();
   } catch (err) {
     showErrorBanner("Schema Initialization Failed", err.message);
   }
@@ -601,6 +837,7 @@ function wireEvents() {
     e.stopPropagation();
     fileInput.click();
   });
+  document.getElementById("ingestAllBtn").addEventListener("click", ingestAllSamples);
 
   dropZone.addEventListener("click", () => fileInput.click());
   dropZone.addEventListener("keydown", (e) => {
@@ -620,36 +857,37 @@ function wireEvents() {
     e.preventDefault();
     dropZone.classList.remove("drag-over");
     const file = e.dataTransfer?.files?.[0];
-    if (file) processUpload(file);
+    if (file) ingestUpload(file);
   });
   fileInput.addEventListener("change", () => {
     const file = fileInput.files?.[0];
-    if (file) processUpload(file);
+    if (file) ingestUpload(file);
     fileInput.value = "";
   });
 
-  document.querySelectorAll(".filter-pill").forEach((pill) => {
-    pill.addEventListener("click", () => {
-      document.querySelectorAll(".filter-pill").forEach((p) => p.classList.remove("active"));
-      pill.classList.add("active");
-      state.activeStatusFilter = pill.dataset.status || "";
-      fetchRecords();
+  document.querySelectorAll(".prompt-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      submitChatQuestion(chip.dataset.prompt);
     });
   });
 
-  let searchTimer = null;
-  document.getElementById("recordsSearchInput").addEventListener("input", (e) => {
-    state.activeSearch = e.target.value;
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(fetchRecords, 220);
+  document.getElementById("chatForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    submitChatQuestion(document.getElementById("chatInput").value);
   });
 
-  document.getElementById("refreshRecordsBtn").addEventListener("click", fetchRecords);
+  document.getElementById("clearChatBtn").addEventListener("click", () => {
+    state.chatHistory = [];
+    renderChatMessages();
+    renderEvidenceList([]);
+  });
+
+  document.getElementById("refreshDocumentsBtn").addEventListener("click", fetchDocuments);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   wireEvents();
   fetchHealth();
   fetchSamples();
-  fetchRecords();
+  fetchDocuments();
 });

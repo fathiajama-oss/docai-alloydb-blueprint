@@ -27,7 +27,7 @@ def is_placeholder_value(value: str | None) -> bool:
 
 
 class Settings(BaseSettings):
-    """Typed runtime settings for Cloud Storage, Document AI, and AlloyDB."""
+    """Typed runtime settings for Cloud Storage, Document AI, Vertex AI, and AlloyDB."""
 
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
@@ -41,6 +41,12 @@ class Settings(BaseSettings):
 
     GCS_INPUT_BUCKET: str = Field(default="")
     GCS_OUTPUT_BUCKET: str = Field(default="")
+
+    VERTEX_EMBEDDING_LOCATION: str = Field(default="us-central1")
+    VERTEX_EMBEDDING_MODEL: str = Field(default="text-embedding-005")
+    VERTEX_CHAT_LOCATION: str = Field(default="global")
+    VERTEX_CHAT_MODEL: str = Field(default="gemini-3-flash-preview")
+    EMBEDDING_DIMENSIONS: int = Field(default=768)
 
     DB_HOST: str = Field(default="127.0.0.1")
     DB_PORT: int = Field(default=5432)
@@ -73,6 +79,10 @@ class Settings(BaseSettings):
             is_placeholder_value(v)
             for v in (self.GCP_PROJECT_ID, self.DOCAI_LOCATION, self.DOCAI_PROCESSOR_ID)
         )
+
+    def is_vertex_configured(self) -> bool:
+        """Returns True if Vertex AI project and model configuration are set."""
+        return not is_placeholder_value(self.GCP_PROJECT_ID)
 
     def is_db_configured(self) -> bool:
         """Returns True if AlloyDB host, port, database, and user are configured."""

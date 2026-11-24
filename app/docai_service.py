@@ -1,7 +1,7 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
 
-"""Real Google Cloud Storage and Document AI integration services."""
+"""Real Google Cloud Storage and Document AI Layout Parser integration."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ import time
 from typing import Any
 
 from google.api_core.client_options import ClientOptions
-from google.api_core.exceptions import GoogleAPIError
+from google.api_core.exceptions import GoogleAPIError, InvalidArgument
 from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import documentai_v1 as documentai
 from google.cloud import storage
 
-from app.cleaning import extract_driver_license_record
+from app.chunking import extract_chunks_from_docai
 from app.config import Settings
 
 
@@ -37,7 +37,7 @@ class PipelineServiceError(RuntimeError):
 
 def _sanitize_filename(filename: str) -> str:
     """Sanitizes a filename for safe Cloud Storage object naming."""
-    base = Path(filename).name or "document"
+    base = Path(filename).name or "document.pdf"
     return re.sub(r"[^A-Za-z0-9._-]", "_", base)
 
 
@@ -45,6 +45,18 @@ def _docai_client(location: str) -> documentai.DocumentProcessorServiceClient:
     """Creates a Document AI client pinned to the configured regional endpoint."""
     options = ClientOptions(api_endpoint=f"{location}-documentai.googleapis.com")
     return documentai.DocumentProcessorServiceClient(client_options=options)
+
+
+def _layout_process_options(chunk_size: int = 450) -> documentai.ProcessOptions:
+    """Builds LayoutConfig ChunkingConfig options for Document AI Layout Parser."""
+    return documentai.ProcessOptions(
+        layout_config=documentai.ProcessOptions.LayoutConfig(
+            chunking_config=documentai.ProcessOptions.LayoutConfig.ChunkingConfig(
+                chunk_size=chunk_size,
+                include_ancestor_headings=True,
+            )
+        )
+    )
 
 
 def upload_bytes_to_gcs(
@@ -142,7 +154,7 @@ def process_document_pipeline(
     mime_type: str,
     settings: Settings,
 ) -> dict[str, Any]:
-    """Executes the live Cloud Storage -> Document AI -> Normalized JSON pipeline."""
+    """Executes Cloud Storage -> Document AI Layout Parser -> Chunk Extraction."""
     missing = settings.missing_gcp_fields()
     if missing:
         raise PipelineConfigError(
@@ -153,7 +165,7 @@ def process_document_pipeline(
     stem = Path(safe_name).stem
     utc_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-    # Stage 1: Upload raw document to Cloud Storage input bucket
+    # Stage 1: Upload raw PDF to Cloud Storage input bucket
     t0 = time.perf_counter()
     input_blob = f"raw/{utc_ts}_{safe_name}"
     source_gcs_uri = upload_bytes_to_gcs(
@@ -165,7 +177,7 @@ def process_document_pipeline(
     )
     gcs_upload_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    # Stage 2: Call Document AI Processor
+    # Stage 2: Call Document AI Layout Parser with ChunkingConfig
     t1 = time.perf_counter()
     processor_name = (
         f"projects/{settings.GCP_PROJECT_ID}/locations/{settings.DOCAI_LOCATION}"
@@ -173,11 +185,24 @@ def process_document_pipeline(
     )
     try:
         client = _docai_client(settings.DOCAI_LOCATION)
+        raw_doc = documentai.RawDocument(content=file_bytes, mime_type=mime_type)
         request = documentai.ProcessRequest(
             name=processor_name,
-            raw_document=documentai.RawDocument(content=file_bytes, mime_type=mime_type),
+            raw_document=raw_doc,
+            process_options=_layout_process_options(),
         )
-        result = client.process_document(request=request)
+        try:
+            result = client.process_document(request=request)
+        except InvalidArgument as exc:
+            # Retry without layout_config if pointed at an OCR/Form processor
+            if "layout_config" in str(exc).lower() or "chunking_config" in str(exc).lower() or "process_options" in str(exc).lower():
+                fallback_req = documentai.ProcessRequest(
+                    name=processor_name,
+                    raw_document=raw_doc,
+                )
+                result = client.process_document(request=fallback_req)
+            else:
+                raise
     except (DefaultCredentialsError, GoogleAPIError, Exception) as exc:
         raise PipelineServiceError("docai_parse", f"Document AI processing failed: {exc}") from exc
     docai_parse_ms = round((time.perf_counter() - t1) * 1000, 1)
@@ -196,14 +221,24 @@ def process_document_pipeline(
     gcs_json_write_ms = round((time.perf_counter() - t2) * 1000, 1)
 
     document_dict = json.loads(raw_json_str)
-    extracted = extract_driver_license_record(document_dict)
+    page_count, chunks = extract_chunks_from_docai(document_dict)
 
-    # Keep a concise, readable summary of the raw Document AI JSON for the proof drawer
+    if not chunks:
+        raise PipelineServiceError(
+            "docai_parse",
+            "Document AI returned no extractable layout chunks or text for this document.",
+        )
+
+    raw_chunks = (
+        (document_dict.get("chunkedDocument") or document_dict.get("chunked_document") or {}).get("chunks")
+        or []
+    )
     docai_json_summary = {
-        "mimeType": document_dict.get("mimeType"),
-        "text": document_dict.get("text", ""),
-        "entityCount": len(document_dict.get("entities") or []),
-        "entities": document_dict.get("entities") or [],
+        "mimeType": document_dict.get("mimeType") or mime_type,
+        "processor": processor_name,
+        "pageCount": page_count,
+        "chunkCount": len(chunks),
+        "sampleChunks": raw_chunks[:5] if raw_chunks else chunks[:5],
     }
 
     return {
@@ -214,21 +249,8 @@ def process_document_pipeline(
         },
         "source_gcs_uri": source_gcs_uri,
         "output_gcs_uri": output_gcs_uri,
-        "record": {
-            "dl_number": extracted["dl_number"],
-            "given_name": extracted["given_name"],
-            "surname": extracted["surname"],
-            "address": extracted["address"],
-            "dob": extracted["dob"],
-            "expiration_date": extracted["expiration_date"],
-            "issue_date": extracted["issue_date"],
-            "avg_confidence": extracted["avg_confidence"],
-            "raw_entities": extracted["raw_entities"],
-            "source_gcs_uri": source_gcs_uri,
-            "output_gcs_uri": output_gcs_uri,
-        },
-        "bounding_boxes": extracted["bounding_boxes"],
-        "entities_with_boxes": extracted["entities_with_boxes"],
+        "page_count": page_count,
+        "chunks": chunks,
         "raw_docai_json": docai_json_summary,
     }
 
@@ -259,23 +281,37 @@ def batch_process_gcs_documents(
 
     try:
         client = _docai_client(settings.DOCAI_LOCATION)
+        input_cfg = documentai.BatchDocumentsInputConfig(
+            gcs_prefix=documentai.GcsPrefix(gcs_uri_prefix=gcs_input_prefix_uri)
+        )
+        output_cfg = documentai.DocumentOutputConfig(
+            gcs_output_config=documentai.DocumentOutputConfig.GcsOutputConfig(
+                gcs_uri=gcs_output_uri
+            )
+        )
         request = documentai.BatchProcessRequest(
             name=processor_name,
-            input_documents=documentai.BatchDocumentsInputConfig(
-                gcs_prefix=documentai.GcsPrefix(gcs_uri_prefix=gcs_input_prefix_uri)
-            ),
-            document_output_config=documentai.DocumentOutputConfig(
-                gcs_output_config=documentai.DocumentOutputConfig.GcsOutputConfig(
-                    gcs_uri=gcs_output_uri
-                )
-            ),
+            input_documents=input_cfg,
+            document_output_config=output_cfg,
+            process_options=_layout_process_options(),
         )
-        operation = client.batch_process_documents(request=request)
-        operation.result(timeout=timeout)
+        try:
+            operation = client.batch_process_documents(request=request)
+            operation.result(timeout=timeout)
+        except InvalidArgument as exc:
+            if "layout_config" in str(exc).lower() or "chunking_config" in str(exc).lower() or "process_options" in str(exc).lower():
+                fallback_req = documentai.BatchProcessRequest(
+                    name=processor_name,
+                    input_documents=input_cfg,
+                    document_output_config=output_cfg,
+                )
+                operation = client.batch_process_documents(request=fallback_req)
+                operation.result(timeout=timeout)
+            else:
+                raise
     except (DefaultCredentialsError, GoogleAPIError, Exception) as exc:
         raise PipelineServiceError("docai_batch", f"Batch processing failed: {exc}") from exc
 
-    # Locate and download JSON outputs written under gcs_output_uri
     without_scheme = gcs_output_uri[5:]
     bucket_name, _, prefix = without_scheme.partition("/")
     storage_client = storage.Client(project=settings.GCP_PROJECT_ID)

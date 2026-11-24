@@ -1,19 +1,20 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
 
-"""Standalone CLI batch & online pipeline matching the Medium blueprint.
+"""Standalone CLI for multi-page PDF ingestion, vectorization, and grounded Q&A.
 
-Uploads driver's license documents to Cloud Storage, runs Document AI
+Uploads PDF documents to Cloud Storage, runs Document AI Layout Parser
 (online `process_document` or asynchronous `batch_process_documents`),
-cleans extracted fields, and persists records into AlloyDB for PostgreSQL.
+generates 768-d embeddings via Vertex AI, persists vectors into AlloyDB for
+PostgreSQL (`pgvector`), and optionally runs a hybrid search + Gemini query.
 """
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import mimetypes
 from pathlib import Path
+import re
 import sys
 from typing import Iterable
 
@@ -22,84 +23,85 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.cleaning import extract_driver_license_record  # noqa: E402
+from app.chunking import extract_chunks_from_docai  # noqa: E402
 from app.config import get_settings  # noqa: E402
-from app.db import init_db, insert_license_record  # noqa: E402
+from app.db import (  # noqa: E402
+    hybrid_search_chunks,
+    init_db,
+    insert_document_and_chunks,
+)
 from app.docai_service import (  # noqa: E402
     batch_process_gcs_documents,
     process_document_pipeline,
     upload_bytes_to_gcs,
 )
+from app.rag_service import embed_texts, generate_grounded_answer  # noqa: E402
 
 
-SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".pdf"}
-
-
-def _discover_documents(input_dir: Path, include_duplicate_pdfs: bool = False) -> list[Path]:
-    """Discovers supported image/PDF documents in `input_dir`."""
+def _discover_pdfs(input_dir: Path) -> list[Path]:
+    """Discovers PDF files inside `input_dir`."""
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
-
-    all_files = sorted(
+    return sorted(
         p for p in input_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        if p.is_file() and p.suffix.lower() == ".pdf"
     )
 
-    if include_duplicate_pdfs:
-        return all_files
 
-    # Avoid double-processing companion PDFs when a PNG with the same stem exists
-    png_stems = {p.stem for p in all_files if p.suffix.lower() in {".png", ".jpg", ".jpeg"}}
-    filtered: list[Path] = []
-    for path in all_files:
-        if path.suffix.lower() == ".pdf" and path.stem in png_stems:
-            continue
-        filtered.append(path)
-    return filtered
+def _readable_title(filename: str) -> str:
+    """Formats a human-readable document title from a PDF filename."""
+    return Path(filename).stem.replace("_", " ").replace("-", " ").strip() or filename
 
 
-def _infer_mime_type(path: Path) -> str:
-    """Infers MIME type for PNG, JPEG, or PDF files."""
-    ext = path.suffix.lower()
-    if ext == ".png":
-        return "image/png"
-    if ext in {".jpg", ".jpeg"}:
-        return "image/jpeg"
-    if ext == ".pdf":
-        return "application/pdf"
-    guessed, _ = mimetypes.guess_type(str(path))
-    return guessed or "application/octet-stream"
+def _embed_chunks(chunks: list[dict], settings) -> list[list[float]]:
+    """Builds contextual chunk strings and fetches 768-d Vertex AI embeddings."""
+    texts = [
+        f"{chunk['section_heading']}\n{chunk['content']}"
+        if chunk.get("section_heading")
+        else chunk["content"]
+        for chunk in chunks
+    ]
+    return embed_texts(texts=texts, settings=settings, task_type="RETRIEVAL_DOCUMENT")
 
 
 def run_online(files: Iterable[Path]) -> int:
-    """Processes each document synchronously via Document AI and inserts into AlloyDB."""
+    """Processes each PDF synchronously via Document AI Layout Parser and AlloyDB."""
     settings = get_settings()
     init_db(settings)
 
     processed = 0
     for path in files:
-        mime_type = _infer_mime_type(path)
-        print(f"[online] Processing {path.name} ({mime_type})...")
-        result = process_document_pipeline(
+        print(f"[online] Processing {path.name}...")
+        docai_res = process_document_pipeline(
             file_bytes=path.read_bytes(),
             filename=path.name,
-            mime_type=mime_type,
+            mime_type="application/pdf",
             settings=settings,
         )
-        inserted, _ = insert_license_record(settings, result["record"])
+        chunks = docai_res["chunks"]
+        embeddings = _embed_chunks(chunks, settings)
+        doc_row, _ = insert_document_and_chunks(
+            settings=settings,
+            doc_meta={
+                "title": _readable_title(path.name),
+                "filename": path.name,
+                "page_count": docai_res["page_count"],
+                "source_gcs_uri": docai_res["source_gcs_uri"],
+                "output_gcs_uri": docai_res["output_gcs_uri"],
+            },
+            chunks=chunks,
+            embeddings=embeddings,
+        )
         processed += 1
         print(
-            f"  -> Persisted id={inserted['id']} "
-            f"dl={inserted.get('dl_number')} "
-            f"name={inserted.get('given_name')} {inserted.get('surname')} "
-            f"status={inserted.get('compliance_status')} "
-            f"source={result['source_gcs_uri']}"
+            f"  -> Persisted id={doc_row['id']} pages={doc_row['page_count']} "
+            f"chunks={doc_row['chunk_count']} source={docai_res['source_gcs_uri']}"
         )
     return processed
 
 
 def run_batch(files: list[Path], timeout: int) -> int:
-    """Uploads documents to Cloud Storage, runs BatchProcessDocuments, and persists."""
+    """Uploads PDFs to Cloud Storage, runs BatchProcessDocuments, embeds, and persists."""
     settings = get_settings()
     missing = settings.missing_gcp_fields()
     if missing:
@@ -111,17 +113,15 @@ def run_batch(files: list[Path], timeout: int) -> int:
     input_prefix = f"batch/{utc_ts}/input/"
     output_prefix = f"batch/{utc_ts}/output/"
 
-    uploaded_uris: list[str] = []
     for path in files:
         blob_name = f"{input_prefix}{path.name}"
         uri = upload_bytes_to_gcs(
             bucket_name=settings.GCS_INPUT_BUCKET,
             blob_name=blob_name,
             data=path.read_bytes(),
-            content_type=_infer_mime_type(path),
+            content_type="application/pdf",
             project_id=settings.GCP_PROJECT_ID,
         )
-        uploaded_uris.append(uri)
         print(f"[batch] Uploaded {path.name} -> {uri}")
 
     gcs_input_prefix_uri = f"gs://{settings.GCS_INPUT_BUCKET}/{input_prefix}"
@@ -137,40 +137,76 @@ def run_batch(files: list[Path], timeout: int) -> int:
 
     processed = 0
     for output_uri, doc_dict in outputs:
-        extracted = extract_driver_license_record(doc_dict)
-        record_payload = {
-            "dl_number": extracted["dl_number"],
-            "given_name": extracted["given_name"],
-            "surname": extracted["surname"],
-            "address": extracted["address"],
-            "dob": extracted["dob"],
-            "expiration_date": extracted["expiration_date"],
-            "issue_date": extracted["issue_date"],
-            "avg_confidence": extracted["avg_confidence"],
-            "raw_entities": extracted["raw_entities"],
-            "source_gcs_uri": gcs_input_prefix_uri,
-            "output_gcs_uri": output_uri,
-        }
-        inserted, _ = insert_license_record(settings, record_payload)
+        page_count, chunks = extract_chunks_from_docai(doc_dict)
+        if not chunks:
+            print(f"  [skip] No extractable chunks in {output_uri}")
+            continue
+        raw_stem = Path(output_uri).stem
+        clean_stem = re.sub(r"-\d+$", "", raw_stem)
+        inferred_filename = f"{clean_stem}.pdf"
+        embeddings = _embed_chunks(chunks, settings)
+        doc_row, _ = insert_document_and_chunks(
+            settings=settings,
+            doc_meta={
+                "title": _readable_title(inferred_filename),
+                "filename": inferred_filename,
+                "page_count": page_count,
+                "source_gcs_uri": f"{gcs_input_prefix_uri}{inferred_filename}",
+                "output_gcs_uri": output_uri,
+            },
+            chunks=chunks,
+            embeddings=embeddings,
+        )
         processed += 1
         print(
-            f"  -> Persisted id={inserted['id']} "
-            f"dl={inserted.get('dl_number')} "
-            f"output={output_uri}"
+            f"  -> Persisted id={doc_row['id']} file={inferred_filename} "
+            f"pages={doc_row['page_count']} chunks={doc_row['chunk_count']}"
         )
     return processed
+
+
+def run_query(question: str, top_k: int) -> None:
+    """Executes a hybrid pgvector search and prints a grounded Gemini answer."""
+    settings = get_settings()
+    print(f"\n[query] Question: {question}")
+    q_vec = embed_texts([question], settings=settings, task_type="RETRIEVAL_QUERY")[0]
+    chunks, _ = hybrid_search_chunks(
+        settings=settings,
+        query_embedding=q_vec,
+        query_text=question,
+        top_k=top_k,
+    )
+    if not chunks:
+        print("[query] No chunks matched in AlloyDB.")
+        return
+
+    res = generate_grounded_answer(
+        question=question,
+        retrieved_chunks=chunks,
+        history=None,
+        settings=settings,
+    )
+    print("\n--- Grounded Answer ---")
+    print(res["answer"])
+    print("\n--- Retrieved Citations ---")
+    for idx, ch in enumerate(chunks, start=1):
+        print(
+            f"[{idx}] {ch['document_title']} (Pages {ch['page_start']}-{ch['page_end']}, "
+            f"Section: {ch.get('section_heading') or 'General'}, "
+            f"Cosine: {ch['vector_similarity']}, Hybrid: {ch['hybrid_score']})"
+        )
 
 
 def main() -> int:
     """CLI entrypoint."""
     parser = argparse.ArgumentParser(
-        description="Process driver's license documents with Document AI and store in AlloyDB."
+        description="Ingest multi-page PDFs with Document AI Layout Parser and query via AlloyDB + Gemini."
     )
     parser.add_argument(
         "--input-dir",
         type=Path,
         default=PROJECT_ROOT / "sample_docs",
-        help="Directory containing PNG, JPEG, or PDF documents (default: sample_docs).",
+        help="Directory containing PDF documents (default: sample_docs).",
     )
     parser.add_argument(
         "--mode",
@@ -179,29 +215,45 @@ def main() -> int:
         help="Use synchronous online processing or asynchronous GCS batch processing.",
     )
     parser.add_argument(
-        "--include-duplicate-pdfs",
-        action="store_true",
-        help="Also process PDF companions when an image with the same stem exists.",
-    )
-    parser.add_argument(
         "--timeout",
         type=int,
         default=300,
         help="Timeout in seconds for Document AI batch operations (default: 300).",
     )
+    parser.add_argument(
+        "--query",
+        type=str,
+        default="",
+        help="Optional question to run against AlloyDB pgvector + Gemini after ingestion.",
+    )
+    parser.add_argument(
+        "--query-only",
+        action="store_true",
+        help="Skip ingestion and only run --query against already indexed documents.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of top chunks to retrieve for --query (default: 5).",
+    )
     args = parser.parse_args()
 
-    files = _discover_documents(args.input_dir, include_duplicate_pdfs=args.include_duplicate_pdfs)
-    if not files:
-        print(f"No supported documents found in {args.input_dir}", file=sys.stderr)
-        return 1
+    if not args.query_only:
+        files = _discover_pdfs(args.input_dir)
+        if not files:
+            print(f"No PDF documents found in {args.input_dir}", file=sys.stderr)
+            return 1
 
-    if args.mode == "online":
-        count = run_online(files)
-    else:
-        count = run_batch(files, timeout=args.timeout)
+        if args.mode == "online":
+            count = run_online(files)
+        else:
+            count = run_batch(files, timeout=args.timeout)
+        print(f"Completed ingesting {count} PDF document(s).")
 
-    print(f"Completed processing {count} document(s).")
+    if args.query.strip():
+        run_query(args.query.strip(), top_k=args.top_k)
+
     return 0
 
 

@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SKIP_DIRS = {".venv", "venv", "__pycache__", ".pytest_cache", ".git"}
 
-HEADER_EXTENSIONS = {".py", ".sh", ".sql", ".js", ".css"}
+HEADER_EXTENSIONS = {".py", ".sh", ".sql", ".js", ".css", ".html"}
 HYGIENE_TEXT_EXTENSIONS = {
     ".py",
     ".sh",
@@ -38,6 +38,8 @@ FORBIDDEN_MOCK_TOKENS = (
 
 INTERNAL_PATTERNS = (
     re.compile(r"@" + r"google\.com", re.IGNORECASE),
+    re.compile(r"altostrat" + r"\.com", re.IGNORECASE),
+    re.compile(r"fathiademos", re.IGNORECASE),
     re.compile(r"corp\." + r"google\.com", re.IGNORECASE),
     re.compile(r"googleplex" + r"\.com", re.IGNORECASE),
     re.compile(r"(?<![A-Za-z0-9_/:])" + r"go/[a-z0-9][a-z0-9_\-/]*", re.IGNORECASE),
@@ -45,7 +47,14 @@ INTERNAL_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9_/:])" + r"cl/[0-9]{5,}"),
 )
 
-CURRENCY_PRICING_PATTERN = re.compile(r"(?:\$\s*\d|\£|/mo\b)")
+VERSION_PINNED_DOC_TOKENS = (
+    "gemini-3-flash-preview",
+    "gemini-2.5",
+    "text-embedding-005",
+    "postgresql 15",
+)
+
+CURRENCY_PRICING_PATTERN = re.compile(r"(?:\$\s*\d|\£|\€|/mo\b)")
 
 
 def _iter_repo_files(
@@ -65,11 +74,12 @@ def _iter_repo_files(
     return files
 
 
-def test_license_and_gitignore_present() -> None:
-    """Ensures Apache 2.0 LICENSE and strict .gitignore entries exist."""
+def test_license_contributing_and_gitignore_present() -> None:
+    """Ensures Apache 2.0 LICENSE, CONTRIBUTING.md, and .gitignore entries exist."""
     license_text = (REPO_ROOT / "LICENSE").read_text(encoding="utf-8")
     assert "Apache License" in license_text
     assert "Version 2.0, January 2004" in license_text
+    assert (REPO_ROOT / "CONTRIBUTING.md").is_file()
 
     gitignore_text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
     for pattern in (".env", ".venv/", "__pycache__/", ".pytest_cache/", "*.pyc"):
@@ -77,7 +87,7 @@ def test_license_and_gitignore_present() -> None:
 
 
 def test_spdx_headers_on_all_source_files() -> None:
-    """Verifies Copyright and Apache-2.0 SPDX headers on every code/style/SQL file."""
+    """Verifies Copyright and Apache-2.0 SPDX headers on every code/style/HTML/SQL file."""
     missing: list[str] = []
     for path in _iter_repo_files(HEADER_EXTENSIONS, include_special=False):
         head = "\n".join(path.read_text(encoding="utf-8").splitlines()[:5])
@@ -115,37 +125,49 @@ def test_zero_mocking_in_app_and_scripts() -> None:
 
 
 def test_real_gcp_and_db_sdk_imports_present() -> None:
-    """Verifies real Cloud Storage, Document AI, and psycopg2 imports exist."""
+    """Verifies real Cloud Storage, Document AI, Vertex AI genai, and psycopg2 imports exist."""
     docai_src = (REPO_ROOT / "app" / "docai_service.py").read_text(encoding="utf-8")
     assert "from google.cloud import documentai_v1" in docai_src
     assert "from google.cloud import storage" in docai_src
+
+    rag_src = (REPO_ROOT / "app" / "rag_service.py").read_text(encoding="utf-8")
+    assert "from google import genai" in rag_src
 
     db_src = (REPO_ROOT / "app" / "db.py").read_text(encoding="utf-8")
     assert "import psycopg2" in db_src
 
 
-def test_open_source_ip_and_font_hygiene() -> None:
-    """Checks for internal links, internal emails, proprietary fonts, or currency symbols."""
+def test_open_source_ip_font_and_version_hygiene() -> None:
+    """Checks for internal links, emails, proprietary fonts, currency symbols, and version pins."""
     violations: list[str] = []
+    self_path = Path(__file__).resolve()
 
     for path in _iter_repo_files(HYGIENE_TEXT_EXTENSIONS, include_special=True):
+        if path.resolve() == self_path:
+            continue
         rel = str(path.relative_to(REPO_ROOT))
         text = path.read_text(encoding="utf-8")
+        lowered = text.lower()
 
         for pattern in INTERNAL_PATTERNS:
             if pattern.search(text):
                 violations.append(f"{rel}: matched internal pattern {pattern.pattern}")
 
         if path.suffix.lower() in {".html", ".css", ".js"}:
-            if "google sans" in text.lower():
+            if "google sans" in lowered:
                 violations.append(f"{rel}: proprietary font Google Sans referenced")
 
         if path.suffix.lower() in {".html", ".css", ".md"}:
-            for literal in ("$", "£", "/mo"):
+            for literal in ("$", "£", "€", "/mo"):
                 if literal in text:
                     violations.append(f"{rel}: forbidden pricing/currency token '{literal}'")
         elif path.suffix.lower() == ".js":
             if CURRENCY_PRICING_PATTERN.search(text):
                 violations.append(f"{rel}: forbidden pricing/currency pattern in JS")
+
+        if path.name == "README.md" or path.parent.name == "static":
+            for pinned in VERSION_PINNED_DOC_TOKENS:
+                if pinned in lowered:
+                    violations.append(f"{rel}: version-pinned product name '{pinned}' in docs/UI")
 
     assert not violations, f"Open-source hygiene violations: {violations}"
