@@ -1,0 +1,329 @@
+<!-- Copyright 2026 Google LLC | SPDX-License-Identifier: Apache-2.0 -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Documents to Data — Document AI &amp; AlloyDB Blueprint</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div class="brand-copy">
+          <span class="brand-title">DOCUMENTS TO DATA</span>
+          <span class="brand-divider" aria-hidden="true">|</span>
+          <span class="brand-subtitle">Document AI &amp; AlloyDB for PostgreSQL Blueprint</span>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="healthPill" class="status-pill status-checking" type="button" title="Inspect live Cloud Storage, Document AI, and AlloyDB connectivity">
+          <span class="status-dot"></span>
+          <span id="healthPillLabel">Checking Services...</span>
+        </button>
+        <button id="openProofBtn" class="btn btn-primary" type="button">
+          View SQL &amp; Proof
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Live System Health Details Panel (toggled from top bar pill) -->
+    <section id="healthDrawerPanel" class="health-panel hidden" aria-label="Service Connectivity Status">
+      <div class="health-panel-header">
+        <div>
+          <p class="kicker">LIVE INFRASTRUCTURE DIAGNOSTICS</p>
+          <h2 class="section-title-sm">Google Cloud Service Connectivity</h2>
+        </div>
+        <div class="health-panel-actions">
+          <button id="initSchemaBtn" class="btn btn-secondary btn-sm hidden" type="button">Initialize Schema</button>
+          <button id="refreshHealthBtn" class="btn btn-secondary btn-sm" type="button">Re-check</button>
+          <button id="closeHealthPanelBtn" class="btn btn-ghost btn-sm" type="button">Close</button>
+        </div>
+      </div>
+      <div id="healthGrid" class="health-grid"></div>
+    </section>
+
+    <!-- 4-Node Live Pipeline Strip -->
+    <section class="pipeline-strip" aria-label="Live Execution Pipeline">
+      <div class="pipeline-header">
+        <p class="kicker">END-TO-END PROCESSING PIPELINE</p>
+        <span id="pipelineTotalTime" class="pipeline-total mono">Ready</span>
+      </div>
+      <div class="pipeline-nodes">
+        <div class="pipeline-node" data-step="gcs_upload">
+          <div class="node-top">
+            <span class="node-index mono">01</span>
+            <span class="node-badge" id="badge-gcs_upload">IDLE</span>
+          </div>
+          <div class="node-title">Cloud Storage Intake</div>
+          <div class="node-meta mono" id="time-gcs_upload">Raw document upload</div>
+        </div>
+
+        <div class="pipeline-arrow" aria-hidden="true">&rarr;</div>
+
+        <div class="pipeline-node" data-step="docai_parse">
+          <div class="node-top">
+            <span class="node-index mono">02</span>
+            <span class="node-badge" id="badge-docai_parse">IDLE</span>
+          </div>
+          <div class="node-title">Document AI Parser</div>
+          <div class="node-meta mono" id="time-docai_parse">Entity &amp; box extraction</div>
+        </div>
+
+        <div class="pipeline-arrow" aria-hidden="true">&rarr;</div>
+
+        <div class="pipeline-node" data-step="gcs_json_write">
+          <div class="node-top">
+            <span class="node-index mono">03</span>
+            <span class="node-badge" id="badge-gcs_json_write">IDLE</span>
+          </div>
+          <div class="node-title">Normalized JSON Output</div>
+          <div class="node-meta mono" id="time-gcs_json_write">Cloud Storage archival</div>
+        </div>
+
+        <div class="pipeline-arrow" aria-hidden="true">&rarr;</div>
+
+        <div class="pipeline-node" data-step="alloydb_write">
+          <div class="node-top">
+            <span class="node-index mono">04</span>
+            <span class="node-badge" id="badge-alloydb_write">IDLE</span>
+          </div>
+          <div class="node-title">AlloyDB Persistence</div>
+          <div class="node-meta mono" id="time-alloydb_write">Relational commit</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Honest Error Banner -->
+    <div id="errorBanner" class="error-banner hidden" role="alert">
+      <div class="error-banner-body">
+        <div class="error-banner-title" id="errorTitle">Pipeline Error</div>
+        <div class="error-banner-message" id="errorMessage"></div>
+      </div>
+      <div class="error-banner-actions">
+        <button id="errorSetupHelpBtn" class="btn btn-secondary btn-sm" type="button">Setup Guide</button>
+        <button id="dismissErrorBtn" class="btn btn-ghost btn-sm" type="button">Dismiss</button>
+      </div>
+    </div>
+
+    <!-- Step 1: Select or Upload Identity Document -->
+    <section class="step-section" id="step1">
+      <div class="step-header">
+        <p class="kicker">STEP 01 &mdash; DOCUMENT INTAKE</p>
+        <h1 class="step-title">Select or Upload an Identity Document</h1>
+        <p class="step-subtitle">
+          Upload a driver's license image or PDF, or launch one of the synthetic specimen licenses below through the live Google Cloud pipeline.
+        </p>
+      </div>
+
+      <div class="intake-grid">
+        <div id="dropZone" class="card drop-zone" tabindex="0" role="button" aria-label="Upload driver's license document">
+          <input id="fileInput" type="file" accept=".png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf" hidden />
+          <div class="drop-icon" aria-hidden="true">&#8679;</div>
+          <div class="drop-title">Drop Driver's License Here</div>
+          <p class="drop-caption">Supports PNG, JPEG, or single-page PDF up to 20 MB.</p>
+          <button id="browseFileBtn" class="btn btn-primary" type="button">Choose File &amp; Process</button>
+        </div>
+
+        <div id="samplesGrid" class="samples-grid" aria-live="polite">
+          <!-- Populated dynamically from /api/samples -->
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 2: Visual Extraction & Verification -->
+    <section class="step-section" id="step2">
+      <div class="step-header step-header-inline">
+        <div>
+          <p class="kicker">STEP 02 &mdash; VISUAL EXTRACTION &amp; VERIFICATION</p>
+          <h2 class="step-title">Entity Inspection &amp; Field Grounding</h2>
+        </div>
+        <div id="activeResultBadges" class="result-badges hidden">
+          <span id="activeConfidenceBadge" class="metric-pill">Confidence: --</span>
+          <span id="activeStatusBadge" class="compliance-badge">--</span>
+        </div>
+      </div>
+
+      <div id="verificationEmpty" class="card empty-state">
+        <p class="empty-title">No document processed in this session yet</p>
+        <p class="empty-copy">
+          Select any specimen license or upload a document in Step 01 to inspect extracted fields and interactive bounding polygons.
+        </p>
+      </div>
+
+      <div id="verificationWorkspace" class="verification-grid hidden">
+        <div class="card viewer-card">
+          <div class="viewer-toolbar">
+            <span id="viewerFilename" class="mono viewer-filename">document.png</span>
+            <span class="viewer-hint">Hover a field on the right to highlight its bounding box</span>
+          </div>
+          <div id="documentStage" class="document-stage">
+            <div class="stage-frame">
+              <img id="documentPreviewImg" class="document-img" alt="Processed identity document preview" />
+              <svg id="bboxOverlay" class="bbox-overlay" viewBox="0 0 1 1" preserveAspectRatio="none" aria-hidden="true"></svg>
+            </div>
+            <div id="pdfPlaceholder" class="pdf-placeholder hidden">
+              <div class="pdf-badge mono">PDF DOCUMENT</div>
+              <p>PDF uploaded and parsed via Document AI. Extracted entity coordinates are listed alongside.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card fields-card">
+          <div class="fields-header">
+            <span class="kicker">EXTRACTED &amp; NORMALIZED FIELDS</span>
+            <span id="fieldsCountLabel" class="mono fields-count">0 fields</span>
+          </div>
+          <div id="extractedFieldsList" class="fields-list">
+            <!-- Populated with 7 structured fields -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 3: Structured Records in AlloyDB -->
+    <section class="step-section" id="step3">
+      <div class="step-header step-header-inline">
+        <div>
+          <p class="kicker">STEP 03 &mdash; PERSISTED LEDGER</p>
+          <h2 class="step-title">Structured Records in AlloyDB</h2>
+        </div>
+        <button id="refreshRecordsBtn" class="btn btn-secondary btn-sm" type="button">Refresh Ledger</button>
+      </div>
+
+      <div class="kpi-strip">
+        <div class="card kpi-card">
+          <span class="kpi-label">Total Verified IDs</span>
+          <span id="kpiTotal" class="kpi-value">--</span>
+        </div>
+        <div class="card kpi-card">
+          <span class="kpi-label">Valid</span>
+          <span id="kpiValid" class="kpi-value kpi-valid">--</span>
+        </div>
+        <div class="card kpi-card">
+          <span class="kpi-label">Expiring Soon</span>
+          <span id="kpiExpiring" class="kpi-value kpi-expiring">--</span>
+        </div>
+        <div class="card kpi-card">
+          <span class="kpi-label">Expired</span>
+          <span id="kpiExpired" class="kpi-value kpi-expired">--</span>
+        </div>
+        <div class="card kpi-card">
+          <span class="kpi-label">Mean Extraction Confidence</span>
+          <span id="kpiConfidence" class="kpi-value">--</span>
+        </div>
+      </div>
+
+      <div class="records-toolbar">
+        <div class="filter-pills" role="tablist" aria-label="Filter records by expiration status">
+          <button class="filter-pill active" data-status="" type="button">All</button>
+          <button class="filter-pill" data-status="VALID" type="button">Valid</button>
+          <button class="filter-pill" data-status="EXPIRING_SOON" type="button">Expiring Soon</button>
+          <button class="filter-pill" data-status="EXPIRED" type="button">Expired</button>
+        </div>
+        <div class="search-wrap">
+          <input
+            id="recordsSearchInput"
+            class="search-input"
+            type="search"
+            placeholder="Search by name, license number, or address..."
+            aria-label="Search processed records"
+          />
+        </div>
+      </div>
+
+      <div id="recordsStatusBanner" class="records-notice hidden"></div>
+
+      <div id="recordsList" class="records-list" aria-live="polite">
+        <!-- Populated from GET /api/records -->
+      </div>
+    </section>
+  </main>
+
+  <!-- Slide-over Technical Proof Drawer -->
+  <div id="proofBackdrop" class="drawer-backdrop hidden"></div>
+  <aside id="proofDrawer" class="proof-drawer hidden" aria-label="SQL and Document AI Proof Drawer">
+    <div class="drawer-header">
+      <div>
+        <p class="kicker">TECHNICAL TRANSPARENCY</p>
+        <h2 class="drawer-title">SQL, JSON &amp; Infrastructure Proof</h2>
+      </div>
+      <button id="closeProofBtn" class="btn btn-ghost btn-sm" type="button">Close</button>
+    </div>
+
+    <div class="drawer-tabs" role="tablist">
+      <button class="drawer-tab active" data-tab="sql" type="button">Executed SQL &amp; DDL</button>
+      <button class="drawer-tab" data-tab="json" type="button">Document AI JSON</button>
+      <button class="drawer-tab" data-tab="setup" type="button">AlloyDB Auth Proxy Setup</button>
+    </div>
+
+    <div class="drawer-content">
+      <div id="tab-sql" class="tab-pane active">
+        <div class="code-block-group">
+          <div class="code-label">Latest Executed Statement</div>
+          <pre id="proofLatestSql" class="code-pre mono">-- Process or query records to inspect live SQL statements.</pre>
+        </div>
+        <div class="code-block-group">
+          <div class="code-label">Schema Definition (sql/01_init_schema.sql)</div>
+          <pre id="proofDdlSql" class="code-pre mono"></pre>
+        </div>
+      </div>
+
+      <div id="tab-json" class="tab-pane">
+        <div class="uri-meta-box">
+          <div><span class="uri-label">Source URI:</span> <code id="proofSourceUri" class="mono">Not yet run</code></div>
+          <div><span class="uri-label">Output URI:</span> <code id="proofOutputUri" class="mono">Not yet run</code></div>
+        </div>
+        <div class="code-block-group">
+          <div class="code-label">Raw Document AI Response Entities</div>
+          <pre id="proofRawJson" class="code-pre mono">// Process a document to inspect the live Document AI JSON payload.</pre>
+        </div>
+      </div>
+
+      <div id="tab-setup" class="tab-pane">
+        <p class="setup-intro">
+          Connect your local environment or Cloud Run service to AlloyDB for PostgreSQL and Document AI using these commands:
+        </p>
+        <div class="code-block-group">
+          <div class="code-label-row">
+            <span class="code-label">1. Provision Buckets &amp; US Driver License Processor</span>
+            <button class="btn btn-secondary btn-xs copy-btn" data-copy-target="cmdSetupGcp" type="button">Copy</button>
+          </div>
+          <pre id="cmdSetupGcp" class="code-pre mono">GCP_PROJECT_ID=&lt;YOUR_PROJECT_ID&gt; bash scripts/setup_gcp.sh</pre>
+        </div>
+
+        <div class="code-block-group">
+          <div class="code-label-row">
+            <span class="code-label">2. Start AlloyDB Auth Proxy Locally</span>
+            <button class="btn btn-secondary btn-xs copy-btn" data-copy-target="cmdAuthProxy" type="button">Copy</button>
+          </div>
+          <pre id="cmdAuthProxy" class="code-pre mono">./alloydb-auth-proxy \
+  projects/&lt;YOUR_PROJECT_ID&gt;/locations/us-central1/clusters/&lt;CLUSTER&gt;/instances/&lt;INSTANCE&gt; \
+  --port 5432</pre>
+        </div>
+
+        <div class="code-block-group">
+          <div class="code-label-row">
+            <span class="code-label">3. Run Standalone Batch Pipeline CLI</span>
+            <button class="btn btn-secondary btn-xs copy-btn" data-copy-target="cmdBatchCli" type="button">Copy</button>
+          </div>
+          <pre id="cmdBatchCli" class="code-pre mono">python scripts/batch_pipeline.py --input-dir sample_docs --mode online</pre>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
